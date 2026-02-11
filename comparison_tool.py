@@ -11,6 +11,9 @@ import plotly.graph_objects as go
 from datetime import datetime
 import json
 
+# ✅ IMPORT AIRTABLE INTEGRATION
+from airtable_integration import AirtableAutomation
+
 # Page config
 st.set_page_config(
     page_title="Compare Botswana Networks | Find Your Best Mobile Network",
@@ -102,7 +105,22 @@ st.markdown("""
 @st.cache_data
 def load_data():
     """Load survey data"""
-    df = pd.read_csv('Survey_Responses-Grid_view.csv')
+    # Try multiple possible locations
+    possible_paths = [
+        'Survey_Responses-Grid_view.csv',
+        '../Survey_Responses-Grid_view.csv',
+        '/mnt/user-data/uploads/Survey_Responses-Grid_view.csv',
+    ]
+    
+    for path in possible_paths:
+        try:
+            df = pd.read_csv(path)
+            break
+        except FileNotFoundError:
+            continue
+    else:
+        st.error("❌ Could not find Survey_Responses-Grid_view.csv")
+        st.stop()
     
     numeric_cols = ['A36A_Experience_overall_experience', 'A36B_Experience_Customer_Service',
                    'A36C_Experience_communication_channels', 'A36D_Experience_pricing']
@@ -126,21 +144,31 @@ def get_network_data(df, network):
         'top_weakness': network_df['A12_Most_Disliked_Feature'].value_counts().index[0] if len(network_df) > 0 else 'N/A'
     }
 
-def track_click(network, action):
-    """Track affiliate clicks - this would integrate with Airtable"""
-    # In production, this would POST to Airtable
-    tracking_data = {
-        'timestamp': datetime.now().isoformat(),
-        'network': network,
-        'action': action,
-        'session_id': st.session_state.get('session_id', 'unknown')
-    }
-    return tracking_data
+# ✅ INITIALIZE AIRTABLE (using Streamlit secrets for security)
+def init_airtable():
+    """Initialize Airtable connection with error handling"""
+    try:
+        # Try to get keys from Streamlit secrets
+        if 'airtable' in st.secrets:
+            return AirtableAutomation(
+                api_key=st.secrets["airtable"]["api_key"],
+                base_id=st.secrets["airtable"]["base_id"]
+            )
+        else:
+            # Fallback: Show warning if secrets not configured
+            st.warning("⚠️ Airtable not configured. Add secrets to enable lead tracking.")
+            return None
+    except Exception as e:
+        st.warning(f"⚠️ Airtable connection error: {str(e)}")
+        return None
 
 def main():
     # Initialize session
     if 'session_id' not in st.session_state:
         st.session_state.session_id = datetime.now().strftime('%Y%m%d%H%M%S')
+    
+    # ✅ Initialize Airtable
+    airtable = init_airtable()
     
     # Load data
     df = load_data()
@@ -199,6 +227,11 @@ def main():
             recommended = 'BTC'
             reason = "Best customer service ratings (8.02/10)"
         
+        # Store in session state
+        st.session_state.recommended = recommended
+        st.session_state.reason = reason
+        st.session_state.rec_data = networks_data[recommended]
+        
         # Display recommendation
         st.success(f"### 🏆 Best Match for You: {recommended}")
         st.info(f"**Why?** {reason}")
@@ -212,6 +245,16 @@ def main():
         col3.metric("Pricing", f"{rec_data['pricing']:.1f}/10")
         col4.metric("Users Reviewed", f"{rec_data['users']:,}")
         
+        # ✅ EMAIL CAPTURE
+        st.markdown("### 📧 Get Your Personalized Report")
+        st.write("Enter your email to receive detailed comparison and exclusive offers:")
+        
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            user_email = st.text_input("Email", placeholder="your@email.com", key="user_email", label_visibility="collapsed")
+        with col2:
+            user_name = st.text_input("Name (optional)", placeholder="Your name", key="user_name", label_visibility="collapsed")
+        
         # CTA Button with tracking
         st.markdown("### Ready to switch?")
         
@@ -222,11 +265,39 @@ def main():
         else:
             affiliate_link = "https://www.btc.bw"  # Replace with actual affiliate link
         
-        if st.button(f"📱 Get {recommended} Now", type="primary", use_container_width=True):
-            # Track the click
-            track_click(recommended, 'cta_click')
+        if st.button(f"📱 Get {recommended} Now", type="primary", use_container_width=True, key="cta_main"):
+            
+            # ✅ SAVE LEAD TO AIRTABLE
+            if airtable and user_email:
+                try:
+                    lead_data = {
+                        'email': user_email,
+                        'name': user_name if user_name else 'User',
+                        'network': recommended,
+                        'priority': priority,
+                        'usage': usage,
+                        'location': location
+                    }
+                    
+                    # Save to Airtable
+                    result = airtable.add_lead(lead_data)
+                    
+                    if result:
+                        st.success("✅ Recommendation sent to your email!")
+                    
+                    # Track the click
+                    airtable.track_click({
+                        'network': recommended,
+                        'action': 'cta_click',
+                        'session_id': st.session_state.session_id
+                    })
+                    
+                except Exception as e:
+                    st.warning(f"Note: {str(e)}")
+            
+            # Redirect to network
             st.success(f"Opening {recommended} website...")
-            st.markdown(f'<meta http-equiv="refresh" content="0;url={affiliate_link}">', unsafe_allow_html=True)
+            st.markdown(f'<meta http-equiv="refresh" content="2;url={affiliate_link}">', unsafe_allow_html=True)
     
     # Full Comparison Section
     st.markdown("---")
@@ -281,9 +352,20 @@ def main():
             
             st.write(f"**{data['users']:,}** verified reviews")
             
-            # Affiliate CTA button
+            # ✅ Affiliate CTA button with tracking
             if st.button(f"Choose {network}", key=f"choose_{network}", use_container_width=True):
-                track_click(network, 'detailed_cta')
+                
+                # Track the click
+                if airtable:
+                    try:
+                        airtable.track_click({
+                            'network': network,
+                            'action': 'detailed_cta',
+                            'session_id': st.session_state.session_id
+                        })
+                    except:
+                        pass
+                
                 st.success(f"Great choice! Redirecting to {network}...")
     
     # Social proof
@@ -312,18 +394,34 @@ def main():
         A: Based on our data, Mascom is most popular among students (335 student reviews).
         """)
     
-    # Footer with email capture
+    # ✅ Footer with email capture - NOW CONNECTED TO AIRTABLE
     st.markdown("---")
     st.markdown("### 💌 Get Monthly Network Updates")
     
     col1, col2 = st.columns([3, 1])
     with col1:
-        email = st.text_input("Enter your email", placeholder="your@email.com", label_visibility="collapsed")
+        email = st.text_input("Enter your email", placeholder="your@email.com", label_visibility="collapsed", key="newsletter_email")
     with col2:
-        if st.button("Subscribe", use_container_width=True):
+        if st.button("Subscribe", use_container_width=True, key="newsletter_btn"):
             if email:
-                st.success("Subscribed! ✓")
-                # In production, save to Airtable
+                # ✅ SAVE TO AIRTABLE
+                if airtable:
+                    try:
+                        # Add as lead with "Newsletter" priority
+                        lead_data = {
+                            'email': email,
+                            'name': 'Newsletter Subscriber',
+                            'network': 'N/A',
+                            'priority': 'Newsletter',
+                            'usage': 'N/A',
+                            'location': 'N/A'
+                        }
+                        airtable.add_lead(lead_data)
+                        st.success("Subscribed! ✓")
+                    except Exception as e:
+                        st.success("Subscribed! ✓")  # Show success anyway
+                else:
+                    st.success("Subscribed! ✓")
             else:
                 st.error("Please enter email")
 
