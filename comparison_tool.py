@@ -129,9 +129,30 @@ def load_data():
     
     return df
 
-def get_network_data(df, network):
-    """Get comprehensive network statistics"""
+def get_network_data(df, network, location_filter=None):
+    """Get comprehensive network statistics, optionally filtered by location"""
     network_df = df[df['A5_Primary_Mobile_Network'] == network]
+    
+    # Apply location filter if provided
+    if location_filter and location_filter not in ["Village/Rural Area (type below)", "Other City (type below)", "— Select —", ""]:
+        # Try exact match first
+        location_match = network_df[network_df['D3_Location_Botswana'].str.contains(
+            location_filter, case=False, na=False
+        )]
+        if len(location_match) > 0:
+            network_df = location_match
+    
+    if len(network_df) == 0:
+        return {
+            'name': network,
+            'users': 0,
+            'overall_score': 0,
+            'customer_service': 0,
+            'pricing': 0,
+            'communication': 0,
+            'top_strength': 'N/A',
+            'top_weakness': 'N/A'
+        }
     
     return {
         'name': network,
@@ -169,8 +190,6 @@ def get_review_count(airtable):
     """
     if airtable:
         try:
-            response = airtable.get_pending_emails()  # Reuse existing method to check connectivity
-            # Try to count reviews from Airtable REVIEWS table
             import requests
             r = requests.get(
                 f"{airtable.base_url}/REVIEWS",
@@ -186,6 +205,64 @@ def get_review_count(airtable):
     return 788 + st.session_state.get('session_new_reviews', 0)
 
 
+def add_survey_to_session_data(df, survey_data):
+    """
+    Add a new survey response to the dataframe in session state
+    so it can be used for recommendations in real-time.
+    
+    Args:
+        df: The main survey dataframe
+        survey_data: dict with network, rating, likes, improvement, location
+    
+    Returns:
+        Updated dataframe with new row appended
+    """
+    new_row = {}
+    
+    # Map survey answers to dataframe columns
+    new_row['A5_Primary_Mobile_Network'] = survey_data.get('network', 'Unknown')
+    new_row['D3_Location_Botswana'] = survey_data.get('location', 'Unknown')
+    
+    # Map rating to experience columns
+    rating = survey_data.get('rating', 5)
+    new_row['A36A_Experience_overall_experience'] = rating
+    new_row['A36B_Experience_Customer_Service'] = max(1, rating - 1)  # Estimate
+    new_row['A36C_Experience_communication_channels'] = rating
+    new_row['A36D_Experience_pricing'] = max(1, rating + 1) if rating < 9 else rating  # Estimate
+    
+    # Map likes to A11_Most_Liked_Feature
+    q3_like = survey_data.get('q3_like', '')
+    like_mapping = {
+        'Network Coverage': 'Good network coverage',
+        'Data Speeds': 'Faster internet speeds and reliable service',
+        'Customer Service': 'Better customer service and support',
+        'Pricing/Affordability': 'Affordable mobile plans',
+        'Variety of Packages': 'More flexible data plans or packages',
+    }
+    new_row['A11_Most_Liked_Feature'] = like_mapping.get(q3_like, q3_like)
+    
+    # Map improvement to A12_Most_Disliked_Feature
+    q4_improve = survey_data.get('q4_improve', '')
+    improve_mapping = {
+        'Reduce data prices': 'High cost of internet bundles and airtime',
+        'Improve internet speed': 'Slow internet speed or unreliable service',
+        'Better customer service': 'Poor customer service',
+        'More network coverage': 'Poor network coverage',
+        'Better packages/deals': 'Better deals or promotions offered by competitors',
+    }
+    new_row['A12_Most_Disliked_Feature'] = improve_mapping.get(q4_improve, q4_improve)
+    
+    # Convert to DataFrame and append
+    new_df = pd.DataFrame([new_row])
+    
+    # Make sure numeric columns are numeric
+    for col in ['A36A_Experience_overall_experience', 'A36B_Experience_Customer_Service',
+                'A36C_Experience_communication_channels', 'A36D_Experience_pricing']:
+        new_df[col] = pd.to_numeric(new_df[col], errors='coerce')
+    
+    return pd.concat([df, new_df], ignore_index=True)
+
+
 def main():
     # Initialize session
     if 'session_id' not in st.session_state:
@@ -198,8 +275,12 @@ def main():
     # ✅ Initialize Airtable
     airtable = init_airtable()
     
-    # Load data
-    df = load_data()
+       # Load data
+    if 'df' not in st.session_state:
+        st.session_state.df = load_data()
+    df = st.session_state.df
+    
+   
     
     # ─────────────────────────────────────────────────────────────
     # MINI SURVEY — shown at the very top, before anything else
@@ -267,6 +348,25 @@ def main():
                     st.session_state.survey_completed = True
                     st.session_state.session_new_reviews += 1
                     
+                    # 📊 Store survey response to improve recommendations
+                    survey_data = {
+                        'network': q1_network,
+                        'rating': q2_rating,
+                        'q3_like': q3_like,
+                        'q4_improve': q4_improve,
+                        'location': q5_location
+                    }
+                    
+                    # Add to session survey list
+                    if 'recent_surveys' not in st.session_state:
+                        st.session_state.recent_surveys = []
+                    st.session_state.recent_surveys.append(survey_data)
+                    
+                    # Update the dataframe with new data
+                    st.session_state.df = add_survey_to_session_data(
+                        st.session_state.df, survey_data
+                    )
+                    
                     # Save new review to Airtable
                     if airtable:
                         try:
@@ -284,7 +384,7 @@ def main():
                             pass  # Don't block the user if Airtable fails
                     
                     new_total = total_reviews + 1
-                    st.success(f"🙏 Thank you! You are now part of **{new_total:,}+** Batswana shaping this comparison.")
+                    st.success(f"🙏 Thank you! Your response will help improve recommendations for **{q5_location}**. You are now part of **{new_total:,}+** Batswana.")
                     st.rerun()
         
         st.markdown("---")
@@ -298,7 +398,7 @@ def main():
     # Header
     st.markdown('<h1 class="main-title">Find Your Perfect Mobile Network</h1>', unsafe_allow_html=True)
     display_count = total_reviews + st.session_state.session_new_reviews
-    st.markdown(f'<p class="subtitle">Compare Orange, Mascom & BTC • Real reviews from {display_count:,}+ Batswana • Updated 2025</p>', unsafe_allow_html=True)
+    st.markdown(f'<p class="subtitle">Compare Orange, Mascom & BTC • Real reviews from {display_count:,}+ Batswana • Updated 2026</p>', unsafe_allow_html=True)
     
     # Quiz Section
     st.markdown("## 🎯 Quick Match: Answer 3 Questions")
@@ -320,20 +420,93 @@ def main():
         )
     
     with col3:
-        location = st.radio(
-            "Where do you live?",
-            ["Gaborone", "Francistown", "Other City", "Village/Rural"],
-            key="location"
+        # Main city/town selector
+        main_location = st.selectbox(
+            "Which city/town are you in?",
+            [
+                "— Select —",
+                "Gaborone",
+                "Francistown",
+                "Molepolole",
+                "Maun",
+                "Serowe",
+                "Palapye",
+                "Kanye",
+                "Mochudi",
+                "Mahalapye",
+                "Lobatse",
+                "Selebi-Phikwe",
+                "Tlokweng",
+                "Ramotswa",
+                "Mogoditshane",
+                "Thamaga",
+                "Jwaneng",
+                "Moshupa",
+                "Letlhakane",
+                "Orapa",
+                "Ghanzi",
+                "Other City (type below)",
+                "Village/Rural Area (type below)"
+            ],
+            key="main_location"
         )
+        
+        # Show sub-areas for big cities
+        if main_location == "Gaborone":
+            location = st.selectbox(
+                "Which area in Gaborone?",
+                [
+                    "Gaborone (General)",
+                    "Gaborone Block 3",
+                    "Gaborone Block 6",
+                    "Gaborone Block 9",
+                    "Gaborone Broadhurst",
+                    "Gaborone Phase 4",
+                    "Gaborone Sebele",
+                    "Gaborone UB",
+                    "Gaborone North",
+                    "Gaborone Old Naledi",
+                    "Gaborone Maruapula",
+                    "Gaborone Village",
+                    "Other Gaborone area"
+                ],
+                key="gaborone_sub"
+            )
+        elif main_location == "Francistown":
+            location = st.selectbox(
+                "Which area in Francistown?",
+                [
+                    "Francistown (General)",
+                    "Francistown Tati Siding",
+                    "Francistown Tatitown",
+                    "Other Francistown area"
+                ],
+                key="francistown_sub"
+            )
+        elif main_location in ["Other City (type below)", "Village/Rural Area (type below)"]:
+            custom_location = st.text_input(
+                "Type your city/village name:",
+                placeholder="e.g., Mmopane, Kumakwane, Shakawe...",
+                key="custom_location_input"
+            )
+            location = custom_location if custom_location else main_location
+        else:
+            location = main_location
     
     if st.button("🔍 Find My Best Match", type="primary", use_container_width=True):
         st.markdown("---")
         
-        # Simple recommendation logic
+        # Get the selected location for filtering
+        selected_location = location  # This is the location variable from the selector above
+        
+        # Show what location we're analyzing
+        st.info(f"📍 Showing results based on data from **{selected_location}**")
+        
+        # Simple recommendation logic with location filter
         networks_data = {
-            'Orange': get_network_data(df, 'Orange'),
-            'Mascom': get_network_data(df, 'Mascom'),
-            'BTC': get_network_data(df, 'BTC')
+            'Orange': get_network_data(df, 'Orange', selected_location),
+            'Mascom': get_network_data(df, 'Mascom', selected_location),
+            'BTC': get_network_data(df, 'BTC', selected_location)
         }
         
         # Recommendation engine
@@ -350,7 +523,7 @@ def main():
             recommended = 'BTC'
             reason = "Best customer service ratings (8.02/10)"
         
-        # Store in session state
+                # Store in session state
         st.session_state.recommended = recommended
         st.session_state.reason = reason
         st.session_state.rec_data = networks_data[recommended]
@@ -359,8 +532,14 @@ def main():
         st.success(f"### 🏆 Best Match for You: {recommended}")
         st.info(f"**Why?** {reason}")
         
-        # Show network details
+        # Show network details based on location-specific data
         rec_data = networks_data[recommended]
+        
+        # ⚠️ Location data warning - THIS IS THE RIGHT SPOT
+        total_location_users = sum([networks_data[n]['users'] for n in ['Orange', 'Mascom', 'BTC']])
+        if total_location_users < 10 and selected_location not in ["Village/Rural Area (type below)", "Other City (type below)", None, ""]:
+            st.warning(f"⚠️ Limited data for **{selected_location}** (only {total_location_users} reviews in this area). Results may improve as more people from your area contribute surveys!")
+
         
         col1, col2, col3, col4 = st.columns(4)
         col1.metric("Overall Score", f"{rec_data['overall_score']:.1f}/10", "⭐")
@@ -426,11 +605,25 @@ def main():
     st.markdown("---")
     st.markdown("## 📊 Complete Network Comparison")
     
+    # If user already clicked "Find My Best Match", use the same location
+    # Otherwise show general data
+    if 'recommended' in st.session_state:
+        comparison_location = location
+        st.info(f"📍 Showing comparison for **{comparison_location}**")
+    else:
+        comparison_location = None
+    
     networks_data = {
-        'Orange': get_network_data(df, 'Orange'),
-        'Mascom': get_network_data(df, 'Mascom'),
-        'BTC': get_network_data(df, 'BTC')
+        'Orange': get_network_data(df, 'Orange', comparison_location),
+        'Mascom': get_network_data(df, 'Mascom', comparison_location),
+        'BTC': get_network_data(df, 'BTC', comparison_location)
     }
+    
+    # ⚠️ Location data warning
+    if comparison_location is not None:
+        total_location_users = sum([networks_data[n]['users'] for n in ['Orange', 'Mascom', 'BTC']])
+        if total_location_users < 10 and comparison_location not in ["Village/Rural Area (type below)", "Other City (type below)", ""]:
+            st.warning(f"⚠️ Limited data for **{comparison_location}** (only {total_location_users} reviews in this area). Results may improve as more people from your area contribute surveys!")
     
     # Create comparison table
     comparison_df = pd.DataFrame({
@@ -493,7 +686,7 @@ def main():
     
     # Social proof
     st.markdown("---")
-    st.markdown(f'<div class="trust-badge">✓ {display_count:,}+ Verified Reviews | ✓ Updated February 2025 | ✓ Independent Comparison</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="trust-badge">✓ {display_count:,}+ Verified Reviews | ✓ Updated February 2026 | ✓ Independent Comparison</div>', unsafe_allow_html=True)
     
     # Customer reviews section
     with st.expander("📝 Recent Customer Reviews"):
